@@ -1,169 +1,277 @@
-# ============================================================
-# INSTALACIÓN AUTOMÁTICA DE VAULTWARDEN EN DOCKER DESKTOP
-# Windows 10 / PowerShell
-# ============================================================
+& {
+    $ErrorActionPreference = "Continue"
+    $ProgressPreference = "SilentlyContinue"
 
-$InstallDir = Join-Path $HOME "Docker\Vaultwarden"
-$ComposeFile = Join-Path $InstallDir "compose.yaml"
-$EnvFile = Join-Path $InstallDir ".env"
-$DataDir = Join-Path $InstallDir "vw-data"
-$VaultURL = "http://localhost:8787"
-$AdminURL = "http://localhost:8787/admin"
+    $ContainerName = "vaultwarden"
+    $VolumeName    = "vaultwarden-data"
+    $ImageName     = "vaultwarden/server:latest"
+    $InstallFolder = Join-Path $env:USERPROFILE "Vaultwarden"
+    $TokenFile     = Join-Path $InstallFolder "admin-token.txt"
 
-Write-Host ""
-Write-Host "=== Instalando Vaultwarden ===" -ForegroundColor Cyan
-Write-Host "Carpeta: $InstallDir"
-Write-Host ""
+    function Invoke-Docker {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string[]]$Arguments,
+            [switch]$AllowFailure,
+            [switch]$Quiet
+        )
 
-# Verificar que Docker esté instalado
-if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    throw "Docker no está instalado o no está disponible en PowerShell."
-}
+        $Output = @(& docker @Arguments 2>&1)
+        $Code = $LASTEXITCODE
+        $Lines = @($Output | ForEach-Object { $_.ToString() })
 
-# Verificar que Docker Desktop esté corriendo
-docker info *> $null
-if ($LASTEXITCODE -ne 0) {
-    throw "Docker Desktop no está corriendo. Abre Docker Desktop y vuelve a ejecutar este script."
-}
+        if (-not $Quiet) {
+            $Lines | ForEach-Object { Write-Host $_ }
+        }
 
-# Verificar Docker Compose
-docker compose version *> $null
-if ($LASTEXITCODE -ne 0) {
-    throw "Docker Compose no está disponible."
-}
+        if (($Code -ne 0) -and (-not $AllowFailure)) {
+            throw "Docker failed with exit code ${Code}:`n$($Lines -join "`n")"
+        }
 
-# Proteger instalaciones existentes administradas desde otra carpeta
-$ExistingContainer = docker ps -a `
-    --filter "name=^/vaultwarden$" `
-    --format "{{.Names}}" 2>$null |
-    Select-Object -First 1
-
-if ($ExistingContainer -eq "vaultwarden" -and -not (Test-Path $ComposeFile)) {
-    throw "Ya existe un contenedor llamado 'vaultwarden'. No se modificó para proteger sus datos."
-}
-
-# Verificar puerto si es una instalación nueva
-if (-not $ExistingContainer) {
-    $PortInUse = Get-NetTCPConnection `
-        -LocalPort 8787 `
-        -State Listen `
-        -ErrorAction SilentlyContinue
-
-    if ($PortInUse) {
-        throw "El puerto 8787 ya está siendo utilizado por otra aplicación."
-    }
-}
-
-# Crear carpetas persistentes
-New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
-
-# Crear o recuperar el token administrativo
-if (-not (Test-Path $EnvFile)) {
-
-    $RandomBytes = New-Object byte[] 32
-    $RandomGenerator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $RandomGenerator.GetBytes($RandomBytes)
-    $RandomGenerator.Dispose()
-
-    $AdminToken = -join ($RandomBytes | ForEach-Object {
-        $_.ToString("x2")
-    })
-
-    "VW_ADMIN_TOKEN=$AdminToken" |
-        Set-Content -Path $EnvFile -Encoding ASCII
-}
-else {
-    $TokenLine = Get-Content $EnvFile |
-        Where-Object { $_ -match "^VW_ADMIN_TOKEN=" } |
-        Select-Object -First 1
-
-    if (-not $TokenLine) {
-        throw "El archivo .env existe, pero no contiene VW_ADMIN_TOKEN."
+        [PSCustomObject]@{
+            ExitCode = $Code
+            Output   = $Lines
+        }
     }
 
-    $AdminToken = $TokenLine.Substring("VW_ADMIN_TOKEN=".Length)
-}
+    function Test-DockerResource {
+        param(
+            [string]$Type,
+            [string]$Name
+        )
 
-# Crear Docker Compose
-@'
-services:
-  vaultwarden:
-    image: vaultwarden/server:latest
-    container_name: vaultwarden
-    hostname: vaultwarden
-    restart: unless-stopped
+        $Result = Invoke-Docker `
+            -Arguments @($Type, "inspect", $Name) `
+            -AllowFailure `
+            -Quiet
 
-    ports:
-      - "127.0.0.1:8787:80"
-
-    environment:
-      TZ: "America/Puerto_Rico"
-      SIGNUPS_ALLOWED: "true"
-      ADMIN_TOKEN: "${VW_ADMIN_TOKEN}"
-
-    volumes:
-      - "./vw-data:/data"
-'@ | Set-Content -Path $ComposeFile -Encoding ASCII
-
-# Descargar y levantar Vaultwarden
-Push-Location $InstallDir
-
-try {
-    Write-Host "Descargando Vaultwarden..." -ForegroundColor Yellow
-    docker compose pull
-
-    if ($LASTEXITCODE -ne 0) {
-        throw "No se pudo descargar la imagen de Vaultwarden."
+        return ($Result.ExitCode -eq 0)
     }
 
-    Write-Host "Iniciando Vaultwarden..." -ForegroundColor Yellow
-    docker compose up -d
+    function New-AdminToken {
+        $Bytes = New-Object byte[] 32
+        $Generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
 
-    if ($LASTEXITCODE -ne 0) {
-        throw "No se pudo iniciar Vaultwarden."
+        try {
+            $Generator.GetBytes($Bytes)
+        }
+        finally {
+            $Generator.Dispose()
+        }
+
+        return -join ($Bytes | ForEach-Object { $_.ToString("x2") })
     }
-}
-finally {
-    Pop-Location
-}
 
-Start-Sleep -Seconds 5
-
-# Validar el contenedor
-$ContainerStatus = docker inspect `
-    --format "{{.State.Status}}" `
-    vaultwarden 2>$null
-
-if ($LASTEXITCODE -ne 0 -or $ContainerStatus -ne "running") {
     Write-Host ""
-    Write-Host "=== Últimos registros ===" -ForegroundColor Red
-    docker logs vaultwarden --tail 50
-    throw "Vaultwarden no inició correctamente."
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host " Vaultwarden Normal Docker Installation" -ForegroundColor Cyan
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    try {
+        if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+            throw "Docker was not found. Install and start Docker Desktop first."
+        }
+
+        $DockerCheck = Invoke-Docker `
+            -Arguments @("info", "--format", "{{.OSType}}") `
+            -AllowFailure `
+            -Quiet
+
+        if ($DockerCheck.ExitCode -ne 0) {
+            throw "Docker Desktop is not running."
+        }
+
+        $DockerType = ($DockerCheck.Output -join "").Trim().ToLowerInvariant()
+
+        if ($DockerType -ne "linux") {
+            throw "Docker Desktop must be using Linux containers."
+        }
+
+        # Remove the previous Caddy containers.
+        foreach ($OldContainer in @("vaultwarden-caddy", "vaultwarden")) {
+            if (Test-DockerResource -Type "container" -Name $OldContainer) {
+                Write-Host "Removing old container: $OldContainer" -ForegroundColor Yellow
+
+                $null = Invoke-Docker `
+                    -Arguments @("container", "rm", "--force", $OldContainer) `
+                    -Quiet
+            }
+        }
+
+        # Remove previous Caddy Docker resources.
+        foreach ($OldVolume in @(
+            "vaultwarden-caddy-data",
+            "vaultwarden-caddy-config",
+            "vaultwarden-caddyfile"
+        )) {
+            if (Test-DockerResource -Type "volume" -Name $OldVolume) {
+                $null = Invoke-Docker `
+                    -Arguments @("volume", "rm", "--force", $OldVolume) `
+                    -AllowFailure `
+                    -Quiet
+            }
+        }
+
+        foreach ($OldNetwork in @(
+            "vaultwarden-network",
+            "vaultwarden_default"
+        )) {
+            if (Test-DockerResource -Type "network" -Name $OldNetwork) {
+                $null = Invoke-Docker `
+                    -Arguments @("network", "rm", $OldNetwork) `
+                    -AllowFailure `
+                    -Quiet
+            }
+        }
+
+        # Remove the previous locally trusted Caddy certificate.
+        $ThumbprintFile = Join-Path $InstallFolder "certificate-thumbprint.txt"
+        $CertificateFile = Join-Path $InstallFolder "caddy-local-root.crt"
+        $CertificateThumbprints = @()
+
+        if (Test-Path $ThumbprintFile) {
+            $SavedThumbprint = (Get-Content $ThumbprintFile -Raw).Trim()
+
+            if (-not [string]::IsNullOrWhiteSpace($SavedThumbprint)) {
+                $CertificateThumbprints += $SavedThumbprint
+            }
+        }
+
+        if (Test-Path $CertificateFile) {
+            try {
+                $OldCertificate =
+                    New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+                        $CertificateFile
+                    )
+
+                if (-not [string]::IsNullOrWhiteSpace($OldCertificate.Thumbprint)) {
+                    $CertificateThumbprints += $OldCertificate.Thumbprint
+                }
+            }
+            catch {
+            }
+        }
+
+        foreach ($Thumbprint in ($CertificateThumbprints | Select-Object -Unique)) {
+            $CertificatePath = "Cert:\CurrentUser\Root\$Thumbprint"
+
+            if (Test-Path $CertificatePath) {
+                Write-Host "Removing the old Caddy certificate..." -ForegroundColor Yellow
+
+                Remove-Item `
+                    -LiteralPath $CertificatePath `
+                    -Force `
+                    -ErrorAction SilentlyContinue
+            }
+        }
+
+        New-Item `
+            -ItemType Directory `
+            -Path $InstallFolder `
+            -Force | Out-Null
+
+        foreach ($OldFile in @(
+            $ThumbprintFile,
+            $CertificateFile,
+            (Join-Path $InstallFolder "Caddyfile")
+        )) {
+            Remove-Item `
+                -LiteralPath $OldFile `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
+
+        # Reuse an existing admin token or generate a new one.
+        if (Test-Path $TokenFile) {
+            $AdminToken = (Get-Content $TokenFile -Raw).Trim()
+        }
+        else {
+            $AdminToken = New-AdminToken
+        }
+
+        if ([string]::IsNullOrWhiteSpace($AdminToken)) {
+            $AdminToken = New-AdminToken
+        }
+
+        Set-Content `
+            -LiteralPath $TokenFile `
+            -Value $AdminToken `
+            -Encoding ASCII `
+            -NoNewline
+
+        Write-Host "Downloading Vaultwarden..." -ForegroundColor Yellow
+
+        $null = Invoke-Docker `
+            -Arguments @("image", "pull", "--quiet", $ImageName) `
+            -Quiet
+
+        if (-not (Test-DockerResource -Type "volume" -Name $VolumeName)) {
+            $null = Invoke-Docker `
+                -Arguments @("volume", "create", $VolumeName) `
+                -Quiet
+        }
+
+        Write-Host "Starting Vaultwarden..." -ForegroundColor Yellow
+
+        $null = Invoke-Docker `
+            -Arguments @(
+                "container", "run",
+                "--detach",
+                "--name", $ContainerName,
+                "--restart", "unless-stopped",
+                "--publish", "127.0.0.1:8080:80",
+                "--volume", "${VolumeName}:/data",
+                "--env", "DOMAIN=http://127.0.0.1:8080",
+                "--env", "ADMIN_TOKEN=$AdminToken",
+                "--env", "SIGNUPS_ALLOWED=true",
+                "--env", "TZ=America/Puerto_Rico",
+                $ImageName
+            ) `
+            -Quiet
+
+        $Ready = $false
+
+        for ($Attempt = 1; $Attempt -le 30; $Attempt++) {
+            try {
+                $Response = Invoke-WebRequest `
+                    -Uri "http://127.0.0.1:8080/alive" `
+                    -UseBasicParsing `
+                    -TimeoutSec 3 `
+                    -ErrorAction Stop
+
+                if ($Response.StatusCode -eq 200) {
+                    $Ready = $true
+                    break
+                }
+            }
+            catch {
+                Start-Sleep -Seconds 2
+            }
+        }
+
+        if (-not $Ready) {
+            throw "The Vaultwarden container started but did not answer on port 8080."
+        }
+
+        Write-Host ""
+        Write-Host "============================================" -ForegroundColor Green
+        Write-Host " Vaultwarden Backend Is Ready" -ForegroundColor Green
+        Write-Host "============================================" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "Local backend:" -ForegroundColor Cyan
+        Write-Host "  http://127.0.0.1:8080"
+        Write-Host ""
+        Write-Host "Admin token:" -ForegroundColor Cyan
+        Write-Host "  $AdminToken" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "Now run the Tailscale Serve block below."
+        Write-Host ""
+    }
+    catch {
+        Write-Host ""
+        Write-Host "Installation failed:" -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Red
+        Write-Host ""
+    }
 }
-
-Write-Host ""
-Write-Host "==============================================" -ForegroundColor Green
-Write-Host " VAULTWARDEN INSTALADO CORRECTAMENTE" -ForegroundColor Green
-Write-Host "==============================================" -ForegroundColor Green
-Write-Host ""
-Write-Host "Vaultwarden:"
-Write-Host $VaultURL -ForegroundColor Cyan
-Write-Host ""
-Write-Host "Panel administrativo:"
-Write-Host $AdminURL -ForegroundColor Cyan
-Write-Host ""
-Write-Host "TOKEN ADMINISTRATIVO:" -ForegroundColor Yellow
-Write-Host $AdminToken -ForegroundColor White
-Write-Host ""
-Write-Host "El token también está guardado en:"
-Write-Host $EnvFile -ForegroundColor Gray
-Write-Host ""
-Write-Host "Datos persistentes:"
-Write-Host $DataDir -ForegroundColor Gray
-Write-Host ""
-Write-Host "Crea ahora tu primera cuenta." -ForegroundColor Yellow
-Write-Host "Después entra al panel /admin y desactiva nuevos registros."
-Write-Host ""
-
-Start-Process $VaultURL
